@@ -295,3 +295,5 @@ For issues or questions:
 1. Check the troubleshooting section above
 2. Verify your device credentials and network settings
 3. Check Serial Monitor output for detailed error messages
+
+thank you
