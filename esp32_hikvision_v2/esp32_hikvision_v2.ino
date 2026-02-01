@@ -20,22 +20,27 @@
 
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include "mbedtls/md.h"
 
 // ======================== CONFIGURATION ========================
 
 // WiFi credentials
-const char* WIFI_SSID = "YourWiFiSSID";
-const char* WIFI_PASSWORD = "YourWiFiPassword";
+const char* WIFI_SSID = "Tenda_AC0418";
+const char* WIFI_PASSWORD = "also5582";
 
 // Hikvision device credentials
-const char* HIK_IP = "10.10.1.142";
+const char* HIK_IPP = "10.10.1.111";
+const char* HIK_IP = "192.168.0.176";
 const char* HIK_USERNAME = "admin";
-const char* HIK_PASSWORD = "YourPassword";
+const char* HIK_PASSWORD = "dev@spa!";
 const bool USE_HTTPS = false;
 
 static unsigned long lastHeartbeat = 0;
+
+// Server to send attendance data
+const char* TRACKER_SERVER = "http://102.217.125.187:8084";
 
 // ======================== GLOBAL VARIABLES ========================
 
@@ -43,6 +48,17 @@ String sessionCookie = "";
 String sessionTag = "";  // NEW: Store sessionTag
 String aesKey = "";
 bool isLoggedIn = false;
+String deviceId = "";  // ESP32 unique device ID
+
+// Event tracking - start time for fetching events (updated as we process)
+String lastEventTime = "";  // Will be set to today's start time initially
+
+// URL parsing structure
+typedef struct {
+  String host;
+  int port;
+  bool isHttps;
+} UrlParts;
 
 // ======================== HELPER FUNCTIONS ========================
 
@@ -115,7 +131,7 @@ String extractXMLTag(const String& xml, const String& tagName) {
 String getISOTimestamp(int hourOffset = 0, int minuteOffset = 0, int secondOffset = 0) {
   time_t now = time(nullptr);
   struct tm timeinfo;
-  gmtime_r(&now, &timeinfo);
+  localtime_r(&now, &timeinfo);  // Use local time (respects configTime timezone)
 
   timeinfo.tm_hour += hourOffset;
   timeinfo.tm_min += minuteOffset;
@@ -123,10 +139,230 @@ String getISOTimestamp(int hourOffset = 0, int minuteOffset = 0, int secondOffse
   mktime(&timeinfo);
 
   char buffer[30];
-  sprintf(buffer, "%04d-%02d-%02dT%02d:%02d:%02d+03:00",
+  sprintf(buffer, "%04d-%02d-%02dT%02d:%02d:%02d+08:00",
           timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-          timeinfo.tm_hour + 3, timeinfo.tm_min, timeinfo.tm_sec);
+          timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
   return String(buffer);
+}
+
+/**
+ * Get ESP32 unique device ID (MAC address based)
+ */
+String getDeviceId() {
+  uint64_t chipId = ESP.getEfuseMac();
+  char id[18];
+  sprintf(id, "%04X%08X", (uint16_t)(chipId >> 32), (uint32_t)chipId);
+  return String(id);
+}
+
+// ======================== TRACKER SERVER FUNCTIONS ========================
+
+/**
+ * Parse URL into components (host, port, isHttps)
+ */
+UrlParts parseUrl(const String& url) {
+  UrlParts parts;
+  parts.isHttps = url.startsWith("https://");
+  parts.port = parts.isHttps ? 443 : 80;
+
+  // Remove protocol
+  String remaining = url;
+  if (parts.isHttps) {
+    remaining = url.substring(8);  // Remove "https://"
+  } else if (url.startsWith("http://")) {
+    remaining = url.substring(7);  // Remove "http://"
+  }
+
+  // Find port if specified (host:port)
+  int colonPos = remaining.indexOf(':');
+  int slashPos = remaining.indexOf('/');
+
+  if (colonPos > 0 && (slashPos < 0 || colonPos < slashPos)) {
+    parts.host = remaining.substring(0, colonPos);
+    if (slashPos > 0) {
+      parts.port = remaining.substring(colonPos + 1, slashPos).toInt();
+    } else {
+      parts.port = remaining.substring(colonPos + 1).toInt();
+    }
+  } else if (slashPos > 0) {
+    parts.host = remaining.substring(0, slashPos);
+  } else {
+    parts.host = remaining;
+  }
+
+  return parts;
+}
+
+/**
+ * Get last event time from server
+ * POST /mobile/getLastTime/{deviceId}
+ * Returns the time string or empty string on failure
+ */
+String getLastTimeFromServer() {
+  if (deviceId.length() == 0) {
+    deviceId = getDeviceId();
+  }
+
+  UrlParts server = parseUrl(String(TRACKER_SERVER));
+  String path = "/mobile/getLastTime/" + deviceId;
+
+  Serial.printf("[*] Getting last time from: %s:%d%s\n",
+                server.host.c_str(), server.port, path.c_str());
+
+  // Connect using appropriate client
+  WiFiClient* client;
+  WiFiClientSecure secureClient;
+  WiFiClient insecureClient;
+
+  if (server.isHttps) {
+    secureClient.setInsecure();
+    client = &secureClient;
+  } else {
+    client = &insecureClient;
+  }
+
+  if (!client->connect(server.host.c_str(), server.port)) {
+    Serial.println("[!] Connection failed");
+    return "";
+  }
+
+  // Send POST request
+  client->println("POST " + path + " HTTP/1.1");
+  client->println("Host: " + server.host + ":" + String(server.port));
+  client->println("Content-Type: application/json");
+  client->println("Content-Length: 0");
+  client->println("Connection: close");
+  client->println();
+
+  // Wait for response
+  unsigned long timeout = millis();
+  while (client->available() == 0) {
+    if (millis() - timeout > 10000) {
+      Serial.println("[!] Response timeout");
+      client->stop();
+      return "";
+    }
+  }
+
+  // Read response
+  String response = "";
+  while (client->available()) {
+    response += client->readStringUntil('\n') + "\n";
+  }
+  client->stop();
+
+  // Check for success
+  if (!response.startsWith("HTTP/1.1 200")) {
+    Serial.println("[!] Failed to get last time");
+    return "";
+  }
+
+  // Extract body (after empty line)
+  int bodyStart = response.indexOf("\r\n\r\n");
+  if (bodyStart < 0) {
+    bodyStart = response.indexOf("\n\n");
+  }
+
+  if (bodyStart < 0) {
+    return "";
+  }
+
+  String lastTime = response.substring(bodyStart + 4);
+  lastTime.trim();
+
+  Serial.println("[*] Last time from server: " + lastTime);
+  return lastTime;
+}
+
+/**
+ * Send attendance event to tracker server
+ * Automatically uses HTTPS or HTTP based on TRACKER_SERVER URL
+ */
+bool sendEventToServer(const char* employeeNo, const char* name, const char* eventTime,
+                       int doorNo, const char* attendanceStatus, const char* verifyMode) {
+
+  if (deviceId.length() == 0) {
+    deviceId = getDeviceId();
+  }
+
+  // Parse server URL
+  UrlParts server = parseUrl(String(TRACKER_SERVER));
+  String path = "/mobile/esp32AttendanceData/" + deviceId;
+
+  // Create JSON payload
+  DynamicJsonDocument doc(512);
+  doc["deviceId"] = deviceId;
+  doc["employeeNo"] = employeeNo;
+  doc["name"] = name;
+  doc["eventTime"] = eventTime;
+  doc["doorNo"] = String(doorNo);
+  doc["attendanceStatus"] = attendanceStatus;
+  doc["verifyMode"] = verifyMode;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  Serial.printf("[*] POST to: %s:%d%s (%s)\n",
+                server.host.c_str(), server.port, path.c_str(),
+                server.isHttps ? "HTTPS" : "HTTP");
+  Serial.println("[*] Body: " + payload);
+
+  // Connect using appropriate client
+  WiFiClient* client;
+  WiFiClientSecure secureClient;
+  WiFiClient insecureClient;
+
+  if (server.isHttps) {
+    secureClient.setInsecure();  // Skip certificate verification
+    client = &secureClient;
+  } else {
+    client = &insecureClient;
+  }
+
+  if (!client->connect(server.host.c_str(), server.port)) {
+    Serial.println("[!] Connection failed");
+    return false;
+  }
+
+  // Send HTTP request
+  client->println("POST " + path + " HTTP/1.1");
+  client->println("Host: " + server.host + ":" + String(server.port));
+  client->println("Content-Type: application/json");
+  client->println("Connection: close");
+  client->print("Content-Length: ");
+  client->println(payload.length());
+  client->println();
+  client->println(payload);
+
+  // Wait for response
+  unsigned long timeout = millis();
+  while (client->available() == 0) {
+    if (millis() - timeout > 10000) {
+      Serial.println("[!] Response timeout");
+      client->stop();
+      return false;
+    }
+  }
+
+  // Read response
+  String response = "";
+  while (client->available()) {
+    response += client->readStringUntil('\n') + "\n";
+  }
+  client->stop();
+
+  Serial.println("[*] Response:");
+  Serial.println(response.substring(0, 200));
+
+  // Check for success
+  bool success = response.startsWith("HTTP/1.1 200") || response.startsWith("HTTP/1.1 201");
+  if (success) {
+    Serial.println("[+] Send OK");
+  } else {
+    Serial.println("[!] Send failed");
+  }
+
+  return success;
 }
 
 // ======================== HIKVISION FUNCTIONS ========================
@@ -190,24 +426,18 @@ String deriveAESKey(const String& pwd, const String& user, const String& salt,
 bool hikvisionLogin() {
   HTTPClient http;
 
-  Serial.println("\n[*] Connecting to Hikvision device...");
-  Serial.printf("[*] IP: %s\n", HIK_IP);
-
-  // Step 1: Get session capabilities with random parameter
-  Serial.println("[*] Step 1: Getting session capabilities...");
-
   String protocol = USE_HTTPS ? "https://" : "http://";
-  int randomNum = random(100000000);  // NEW: Generate random number
+  int randomNum = random(100000000);
   String capUrl = protocol + String(HIK_IP) +
                   "/ISAPI/Security/sessionLogin/capabilities?username=" +
                   String(HIK_USERNAME) + "&random=" + String(randomNum);
 
   http.begin(capUrl);
   http.setTimeout(10000);
+  http.addHeader("Accept", "*/*");
   int httpCode = http.GET();
 
   if (httpCode != 200) {
-    Serial.printf("[!] Failed to get capabilities. HTTP code: %d\n", httpCode);
     http.end();
     return false;
   }
@@ -221,64 +451,45 @@ bool hikvisionLogin() {
   String iterationsStr = extractXMLTag(response, "iterations");
   String salt = extractXMLTag(response, "salt");
   String irreversibleStr = extractXMLTag(response, "isIrreversible");
-  String supportSessionTagStr = extractXMLTag(response, "isSupportSessionTag");  // NEW
-  String sessionIDVersionStr = extractXMLTag(response, "sessionIDVersion");  // NEW
+  String sessionIDVersionStr = extractXMLTag(response, "sessionIDVersion");
 
   if (sessionID.length() == 0 || challenge.length() == 0) {
-    Serial.println("[!] Failed to parse capabilities");
     return false;
   }
 
   int iterations = iterationsStr.toInt();
   bool irreversible = irreversibleStr.equalsIgnoreCase("true");
-  bool supportsSessionTag = supportSessionTagStr.equalsIgnoreCase("true");  // NEW
-  int sessionIDVersion = sessionIDVersionStr.toInt();  // NEW
+  int sessionIDVersion = sessionIDVersionStr.toInt();
 
-  Serial.printf("    Session ID: %s...\n", sessionID.substring(0, 32).c_str());
-  Serial.printf("    Challenge: %s\n", challenge.c_str());
-  Serial.printf("    Iterations: %d\n", iterations);
-  Serial.printf("    Salt: %s...\n", salt.substring(0, 32).c_str());
-  Serial.printf("    Irreversible: %s\n", irreversible ? "true" : "false");
-  Serial.printf("    Supports SessionTag: %s\n", supportsSessionTag ? "true" : "false");  // NEW
-  Serial.printf("    SessionID Version: %d\n", sessionIDVersion);  // NEW
-
-  // Step 2: Encrypt password
-  Serial.println("[*] Step 2: Encrypting password...");
+  // Encrypt password
   String encryptedPwd = encryptPassword(HIK_PASSWORD, HIK_USERNAME,
                                         challenge, salt, iterations, irreversible);
-  Serial.printf("    Encrypted password: %s...\n", encryptedPwd.substring(0, 32).c_str());
 
-  // Step 3: Derive AES key
-  Serial.println("[*] Step 3: Deriving AES key...");
+  // Derive AES key
   aesKey = deriveAESKey(HIK_PASSWORD, HIK_USERNAME, salt, iterations, irreversible);
-  Serial.printf("    AES Key: %s\n", aesKey.c_str());
 
-  // Step 4: Login with sessionTag support
-  Serial.println("[*] Step 4: Performing login with sessionTag support...");
+  // Login with sessionTag support
   unsigned long timestamp = millis();
-
   String loginUrl = protocol + String(HIK_IP) +
                     "/ISAPI/Security/sessionLogin?timeStamp=" + String(timestamp);
 
-  // NEW: Include isNeedSessionTag and sessionIDVersion
   String loginXML = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
   loginXML += "<SessionLogin>\n";
-  loginXML += "    <userName>" + String(HIK_USERNAME) + "</userName>\n";
-  loginXML += "    <password>" + encryptedPwd + "</password>\n";
-  loginXML += "    <sessionID>" + sessionID + "</sessionID>\n";
-  loginXML += "    <isSessionIDValidLongTerm>false</isSessionIDValidLongTerm>\n";
-  loginXML += "    <sessionIDVersion>" + String(sessionIDVersion) + "</sessionIDVersion>\n";
-  loginXML += "    <isNeedSessionTag>true</isNeedSessionTag>\n";  // NEW
+  loginXML += "<userName>" + String(HIK_USERNAME) + "</userName>\n";
+  loginXML += "<password>" + encryptedPwd + "</password>\n";
+  loginXML += "<sessionID>" + sessionID + "</sessionID>\n";
+  loginXML += "<isSessionIDValidLongTerm>false</isSessionIDValidLongTerm>\n";
+  loginXML += "<sessionIDVersion>" + String(sessionIDVersion) + "</sessionIDVersion>\n";
+  loginXML += "<isNeedSessionTag>true</isNeedSessionTag>\n";
   loginXML += "</SessionLogin>";
 
   http.begin(loginUrl);
+  const char* headerKeys[] = {"Set-Cookie"};
+  http.collectHeaders(headerKeys, 1);
   http.addHeader("Content-Type", "application/xml");
   httpCode = http.POST(loginXML);
 
   if (httpCode != 200) {
-    Serial.printf("[!] Login failed. HTTP code: %d\n", httpCode);
-    response = http.getString();
-    Serial.println(response);
     http.end();
     return false;
   }
@@ -294,30 +505,20 @@ bool hikvisionLogin() {
 
   http.end();
 
-  // Parse login response to extract sessionTag
+  // Parse login response
   String statusValue = extractXMLTag(response, "statusValue");
   String statusString = extractXMLTag(response, "statusString");
-  String sessionTagResponse = extractXMLTag(response, "sessionTag");  // NEW
+  String sessionTagResponse = extractXMLTag(response, "sessionTag");
 
-  // Check if login was successful
   if (statusValue == "200" || statusString == "OK") {
-    Serial.println("[+] Login successful!");
-
-    // NEW: Store sessionTag
     if (sessionTagResponse.length() > 0) {
       sessionTag = sessionTagResponse;
-      Serial.printf("    Session Tag: %s...\n", sessionTag.substring(0, 32).c_str());
-    } else {
-      Serial.println("    [!] Warning: No sessionTag in response");
     }
 
     isLoggedIn = true;
     return true;
-  } else {
-    Serial.println("[!] Login failed!");
-    Serial.println(response);
-    return false;
   }
+  return false;
 }
 
 /**
@@ -759,129 +960,303 @@ void fetchEvents(int maxResults = 10, String startTime = "", String endTime = ""
   http.end();
 }
 
+/**
+ * Increment time string by 1 second to avoid re-fetching same event
+ * Input format: "2026-01-28T12:34:56+08:00"
+ */
+String incrementTime(const String& timeStr) {
+  // Simple approach: just replace the last digit of seconds
+  // For a more robust solution, proper time parsing would be needed
+  if (timeStr.length() < 19) return timeStr;
+
+  // Extract seconds and increment
+  int seconds = timeStr.substring(17, 19).toInt();
+  seconds++;
+
+  // Handle overflow (simple - just cap at 59)
+  if (seconds > 59) seconds = 59;
+
+  char newTime[30];
+  snprintf(newTime, sizeof(newTime), "%s%02d%s",
+           timeStr.substring(0, 17).c_str(),
+           seconds,
+           timeStr.substring(19).c_str());
+
+  return String(newTime);
+}
+
+/**
+ * Fetch attendance events with specific format
+ * Uses dynamic start time tracking to avoid re-processing events
+ */
+void fetchAttendanceEvents(int maxResults = 5) {
+  if (!isLoggedIn) {
+    Serial.println("[!] Not logged in");
+    return;
+  }
+
+  HTTPClient http;
+  String protocol = USE_HTTPS ? "https://" : "http://";
+
+  // Generate random IV
+  String iv = randomHex(16);
+
+  // Build URL
+  String url = protocol + String(HIK_IP) +
+               "/ISAPI/AccessControl/AcsEvent?format=json&security=0&iv=" + iv;
+
+  // Verify time is valid before proceeding
+  time_t now = time(nullptr);
+  if (now < 1000000000) {
+    Serial.println("[!] Time not synced, skipping event fetch");
+    return;
+  }
+
+  // Initialize lastEventTime if empty (start of today)
+  if (lastEventTime.length() == 0 || lastEventTime.startsWith("1970")) {
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    char buffer[30];
+    sprintf(buffer, "%04d-%02d-%02dT00:00:00+08:00",
+            timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
+    lastEventTime = String(buffer);
+    Serial.printf("[*] Initialized start time: %s\n", lastEventTime.c_str());
+  }
+
+  // End time is 3 hours in the future (ensures all events are captured)
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+  timeinfo.tm_hour += 24;  // Add 3 hours
+  mktime(&timeinfo);      // Normalize (handles day overflow)
+  char endBuffer[30];
+  sprintf(endBuffer, "%04d-%02d-%02dT%02d:%02d:%02d+08:00",
+          timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+          timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  String endTime = String(endBuffer);
+
+  Serial.printf("[*] Fetching events from: %s to: %s\n", lastEventTime.c_str(), endTime.c_str());
+
+  // Create JSON payload - oldest first (timeReverseOrder = false)
+  DynamicJsonDocument doc(1024);
+  JsonObject cond = doc.createNestedObject("AcsEventCond");
+  cond["searchID"] = generateUUID();
+  cond["searchResultPosition"] = 0;
+  cond["maxResults"] = maxResults;
+  cond["major"] = 0;
+  cond["minor"] = 0;
+  cond["startTime"] = lastEventTime;
+  cond["endTime"] = endTime;
+  cond["timeReverseOrder"] = false;  // Oldest first for sequential processing
+
+  String payload;
+  serializeJson(doc, payload);
+
+  http.begin(url);
+  http.setTimeout(15000);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Accept", "application/json");
+
+  // Add session authentication
+  if (sessionCookie.length() > 0) {
+    http.addHeader("Cookie", sessionCookie);
+  }
+  if (sessionTag.length() > 0) {
+    http.addHeader("sessiontag", sessionTag);
+  }
+
+  int httpCode = http.POST(payload);
+
+  if (httpCode == 200) {
+    String response = http.getString();
+
+    // Parse JSON response
+    DynamicJsonDocument responseDoc(16384);
+    DeserializationError error = deserializeJson(responseDoc, response);
+
+    if (error) {
+      Serial.printf("[!] JSON parse error: %s\n", error.c_str());
+      http.end();
+      return;
+    }
+
+    JsonObject acsEvent = responseDoc["AcsEvent"];
+    int numMatches = acsEvent["numOfMatches"] | 0;
+    int totalMatches = acsEvent["totalMatches"] | 0;
+    Serial.println("----------------------------------------");
+
+    JsonArray events = acsEvent["InfoList"];
+    int sent = 0;
+
+    for (JsonObject event : events) {
+      const char* eventTime = event["time"] | "";
+      const char* employeeNo = event["employeeNoString"] | "";
+
+      // If no employee number, update start time and skip
+      if (strlen(employeeNo) == 0) {
+        if (strlen(eventTime) > 0) {
+          lastEventTime = incrementTime(String(eventTime));
+          Serial.printf("[*] Skipped event (no employee), new start: %s\n", lastEventTime.c_str());
+        }
+        continue;
+      }
+
+      // Extract event data
+      const char* name = event["name"] | "";
+      int doorNo = event["doorNo"] | 0;
+      const char* attendanceStatus = event["attendanceStatus"] | "";
+      const char* verifyMode = event["currentVerifyMode"] | "";
+
+      Serial.printf("[*] %s - %s (%s)\n", eventTime, name, employeeNo);
+
+      // Send event to tracker server
+      if (sendEventToServer(employeeNo, name, eventTime, doorNo, attendanceStatus, verifyMode)) {
+        sent++;
+        // Update start time to avoid re-fetching this event
+        lastEventTime = incrementTime(String(eventTime));
+        Serial.printf("[+] Sent OK, new start: %s\n", lastEventTime.c_str());
+      } else {
+        Serial.println("[!] Send failed, will retry next cycle");
+        // Don't update lastEventTime so we retry this event
+        break;
+      }
+
+      delay(100);
+    }
+
+    if (sent > 0 || numMatches > 0) {
+      Serial.printf("[*] Processed: %d sent, %d total\n", sent, numMatches);
+    }
+
+  } else {
+    Serial.printf("[!] Failed to fetch events. HTTP code: %d\n", httpCode);
+    String response = http.getString();
+    Serial.println("[!] Response:");
+    Serial.println(response);
+  }
+
+  http.end();
+}
+
 // ======================== ARDUINO FUNCTIONS ========================
 
 void setup() {
   Serial.begin(115200);
   delay(2000);
 
-  Serial.println("\n\n========================================");
-  Serial.println("   Hikvision ESP32 Client V2");
-  Serial.println("   with SessionTag Support");
-  Serial.println("========================================\n");
-
-  // Scan for WiFi networks first
-  Serial.println("[*] Scanning for WiFi networks...");
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(100);
-
-  int n = WiFi.scanNetworks();
-  Serial.printf("[*] Found %d networks:\n", n);
-  for (int i = 0; i < n; i++) {
-    Serial.printf("    %d: %s (RSSI: %d dBm, Ch: %d) %s\n",
-                  i + 1,
-                  WiFi.SSID(i).c_str(),
-                  WiFi.RSSI(i),
-                  WiFi.channel(i),
-                  WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "[OPEN]" : "[SECURED]");
-  }
-  Serial.println();
+  Serial.println("\n[*] Hikvision ESP32 Client V2");
 
   // Connect to WiFi
-  Serial.println("[*] Connecting to WiFi...");
-  Serial.printf("[*] SSID: '%s'\n", WIFI_SSID);
-  Serial.printf("[*] Password length: %d characters\n", strlen(WIFI_PASSWORD));
-
-  // Disconnect if previously connected
-  WiFi.disconnect(true);
-  delay(1000);
-
-  // Set WiFi mode
+  Serial.printf("[*] Connecting to WiFi: %s", WIFI_SSID);
   WiFi.mode(WIFI_STA);
-  delay(100);
-
-  // Start connection
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.println("[*] Attempting to connect...");
 
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 40) {
     delay(500);
     Serial.print(".");
     attempts++;
-
-    // Print status every 10 attempts
-    if (attempts % 10 == 0) {
-      Serial.printf("\n[*] Status: %d (Attempts: %d/40)\n", WiFi.status(), attempts);
-    }
   }
 
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("\n[!] Failed to connect to WiFi");
-    Serial.printf("[!] Final status code: %d\n", WiFi.status());
-    Serial.println("\n[!] Troubleshooting steps:");
-    Serial.println("    1. Check SSID is correct (case-sensitive)");
-    Serial.println("    2. Check password is correct");
-    Serial.println("    3. Ensure WiFi is 2.4GHz (ESP32 doesn't support 5GHz)");
-    Serial.println("    4. Move ESP32 closer to router");
-    Serial.println("    5. Check if special characters in password need escaping");
+    Serial.println("\n[!] WiFi connection failed!");
     return;
   }
 
-  Serial.println("\n[+] WiFi connected!");
-  Serial.print("[*] IP address: ");
-  Serial.println(WiFi.localIP());
-  Serial.print("[*] Signal strength (RSSI): ");
-  Serial.print(WiFi.RSSI());
-  Serial.println(" dBm");
+  Serial.println(" OK");
+  Serial.printf("[*] IP: %s | RSSI: %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
 
-  // Initialize random seed
+  // Get device ID
+  deviceId = getDeviceId();
+  Serial.printf("[*] Device ID: %s\n", deviceId.c_str());
+
+  // Sync time via NTP - REQUIRED for proper operation
+  // Timezone +08:00 (8 hours * 3600 seconds) to match Hikvision device
+  Serial.print("[*] NTP sync...");
+  configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+
+  int ntpRetries = 0;
+  while (time(nullptr) < 1000000000 && ntpRetries < 60) {  // Wait up to 30 seconds
+    delay(500);
+    Serial.print(".");
+    ntpRetries++;
+  }
+
+  if (time(nullptr) > 1000000000) {
+    time_t now = time(nullptr);
+    Serial.printf(" OK (%s", ctime(&now));
+
+    // Try to get last event time from server API
+    lastEventTime = getLastTimeFromServer();
+
+    // If server didn't return a valid time, fall back to start of today
+    if (lastEventTime.length() == 0 || lastEventTime.startsWith("1970")) {
+      struct tm timeinfo;
+      localtime_r(&now, &timeinfo);
+      char buffer[30];
+      sprintf(buffer, "%04d-%02d-%02dT00:00:00+08:00",
+              timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
+      lastEventTime = String(buffer);
+      Serial.printf("[*] Using default start time: %s\n", lastEventTime.c_str());
+    } else {
+      Serial.printf("[*] Resuming from server time: %s\n", lastEventTime.c_str());
+    }
+  } else {
+    Serial.println(" FAILED - Cannot proceed without time sync!");
+    Serial.println("[!] Please check internet connection and restart");
+    while(1) { delay(1000); }  // Halt - time sync is required
+  }
+
   randomSeed(analogRead(0));
 
   // Login to Hikvision device
+  Serial.print("[*] Logging into Hikvision...");
   if (!hikvisionLogin()) {
-    Serial.println("\n[!] Failed to login to Hikvision device");
-    Serial.println("[!] Please check your device credentials");
+    Serial.println(" FAILED");
     return;
   }
+  Serial.println(" OK");
 
-  // Demonstrate all features
-  Serial.println("\n========================================");
-  Serial.println("   Running Demonstrations");
-  Serial.println("========================================");
+  // Test server connectivity using parsed URL
+  UrlParts server = parseUrl(String(TRACKER_SERVER));
+  Serial.printf("[*] Testing connection to %s:%d...\n", server.host.c_str(), server.port);
+  WiFiClient testClient;
+  if (testClient.connect(server.host.c_str(), server.port)) {
+    Serial.println("[+] Server reachable!");
+    testClient.stop();
+  } else {
+    Serial.println("[!] Cannot reach server - check firewall/network");
+  }
 
-  // 1. Get device info
-  getDeviceInfo();
-  delay(1000);
-
-  // 2. Get security capabilities
-  getSecurityCapabilities();
-  delay(1000);
-
-  // 3. Fetch users (plaintext)
-  fetchUsersPlaintext(20);
-  delay(1000);
-
-  // 4. Fetch today's events
-  fetchEvents(10);
-  delay(1000);
-
-  Serial.println("\n========================================");
-  Serial.println("   Demo Complete - Entering Loop");
-  Serial.println("========================================\n");
+  // Initial fetch of events
+  fetchAttendanceEvents(5);
 }
 
 void loop() {
-  // Send heartbeat every 60 seconds to keep session alive
-
   unsigned long currentMillis = millis();
 
-  if (currentMillis - lastHeartbeat >= 60000) {
+  // Check every 60 seconds
+  if (currentMillis - lastHeartbeat >= 5000) {
     if (sendHeartbeat()) {
-      Serial.println("[*] Heartbeat sent successfully");
+      // Fetch attendance events on successful heartbeat
+      fetchAttendanceEvents(5);
     } else {
-      Serial.println("[!] Heartbeat failed - may need to re-login");
+      Serial.println("[!] Heartbeat failed, re-logging...");
+
+      // Reset login state
+      isLoggedIn = false;
+      sessionCookie = "";
+      sessionTag = "";
+
+      // Keep trying to login until successful
+      while (!isLoggedIn) {
+        if (hikvisionLogin()) {
+          Serial.println("[+] Re-login OK");
+          fetchAttendanceEvents(5);
+        } else {
+          Serial.println("[!] Login failed, retry in 10s...");
+          delay(10000);
+        }
+      }
     }
     lastHeartbeat = currentMillis;
   }
