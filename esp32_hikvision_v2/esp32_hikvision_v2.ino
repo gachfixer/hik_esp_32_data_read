@@ -21,26 +21,45 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <HTTPUpdate.h>
 #include <ArduinoJson.h>
 #include "mbedtls/md.h"
 
 // ======================== CONFIGURATION ========================
 
+// Firmware version
+#define FIRMWARE_VERSION "1.0.0"
+
+// OTA update configuration
+const char* OTA_VERSION_URL = "http://102.217.125.188:8084/api/version/kivaywa";
+const char* OTA_FIRMWARE_URL = "http://102.217.125.188:8084/kivaywa.bin";
+const unsigned long OTA_CHECK_INTERVAL = 30UL * 60 * 1000;  // Check every 30 minutes
+static unsigned long lastOTACheck = 0;
+
 // WiFi credentials
-const char* WIFI_SSID = "Tenda_AC0418";
-const char* WIFI_PASSWORD = "also5582";
+const char* WIFI_SSID = "TP-Link_DD78";
+const char* WIFI_PASSWORD = "Kivaywa.2026@Tifter";
 
 // Hikvision device credentials
-const char* HIK_IPP = "10.10.1.111";
-const char* HIK_IP = "192.168.0.176";
+const char* HIK_IP = "192.168.1.103";
+const char* HIK_IPP = "192.168.0.176";
 const char* HIK_USERNAME = "admin";
 const char* HIK_PASSWORD = "dev@spa!";
 const bool USE_HTTPS = false;
 
 static unsigned long lastHeartbeat = 0;
 
+// Auto-restart configuration (in milliseconds)
+const unsigned long RESTART_AFTER_UPTIME   = 4UL * 60 * 60 * 1000;  // 4 hours
+const unsigned long RESTART_WIFI_FAIL_MS   = 20UL * 60 * 1000;      // 20 minutes
+const unsigned long RESTART_HIK_FAIL_MS    = 20UL * 60 * 1000;      // 20 minutes
+
+// Failure tracking timestamps (0 = no failure in progress)
+static unsigned long wifiFailSince = 0;
+static unsigned long hikFailSince  = 0;
+
 // Server to send attendance data
-const char* TRACKER_SERVER = "http://102.217.125.187:8084";
+const char* TRACKER_SERVER = "http://102.217.125.188:8084";
 
 // ======================== GLOBAL VARIABLES ========================
 
@@ -61,6 +80,49 @@ typedef struct {
 } UrlParts;
 
 // ======================== HELPER FUNCTIONS ========================
+
+/**
+ * Connect or reconnect to WiFi
+ * Returns true if connected successfully, false otherwise
+ */
+bool connectWiFi(bool isReconnect = false) {
+  if (isReconnect) {
+    Serial.println("[!] WiFi disconnected, reconnecting...");
+
+    // Reset login state since we lost connection
+    isLoggedIn = false;
+    sessionCookie = "";
+    sessionTag = "";
+
+    WiFi.disconnect();
+  } else {
+    Serial.printf("[*] Connecting to WiFi: %s", WIFI_SSID);
+    WiFi.mode(WIFI_STA);
+  }
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(" OK");
+    Serial.printf("[*] IP: %s | RSSI: %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    return true;
+  } else {
+    if (isReconnect) {
+      Serial.println(" FAILED");
+      Serial.println("[!] WiFi reconnect failed, will retry...");
+    } else {
+      Serial.println("\n[!] WiFi connection failed!");
+    }
+    return false;
+  }
+}
 
 /**
  * Calculate SHA-256 hash of input string
@@ -1137,42 +1199,182 @@ void fetchAttendanceEvents(int maxResults = 5) {
   http.end();
 }
 
+// ======================== OTA FIRMWARE UPDATE ========================
+
+/**
+ * Compare two version strings (e.g., "1.0.0" vs "1.0.1")
+ * Returns: 1 if remote > local, 0 if equal, -1 if remote < local
+ */
+int compareVersions(const String& local, const String& remote) {
+  int lMajor = 0, lMinor = 0, lPatch = 0;
+  int rMajor = 0, rMinor = 0, rPatch = 0;
+
+  sscanf(local.c_str(), "%d.%d.%d", &lMajor, &lMinor, &lPatch);
+  sscanf(remote.c_str(), "%d.%d.%d", &rMajor, &rMinor, &rPatch);
+
+  if (rMajor != lMajor) return (rMajor > lMajor) ? 1 : -1;
+  if (rMinor != lMinor) return (rMinor > lMinor) ? 1 : -1;
+  if (rPatch != lPatch) return (rPatch > lPatch) ? 1 : -1;
+  return 0;
+}
+
+/**
+ * Check server for new firmware version and perform OTA update if available
+ */
+void checkForOTAUpdate() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  Serial.println("\n[OTA] Checking for firmware update...");
+  Serial.printf("[OTA] Current version: %s\n", FIRMWARE_VERSION);
+
+  HTTPClient http;
+  http.begin(OTA_VERSION_URL);
+  http.setTimeout(10000);
+  int httpCode = http.GET();
+
+  if (httpCode != 200) {
+    Serial.printf("[OTA] Version check failed, HTTP code: %d\n", httpCode);
+    http.end();
+    return;
+  }
+
+  String response = http.getString();
+  http.end();
+  response.trim();
+
+  Serial.printf("[OTA] Server version: %s\n", response.c_str());
+
+  if (compareVersions(FIRMWARE_VERSION, response) <= 0) {
+    Serial.println("[OTA] Firmware is up to date");
+    return;
+  }
+
+  Serial.println("[OTA] New firmware available! Starting update...");
+  Serial.printf("[OTA] Downloading from: %s\n", OTA_FIRMWARE_URL);
+
+  WiFiClient otaClient;
+  httpUpdate.setLedPin(LED_BUILTIN, LOW);
+
+  t_httpUpdate_return ret = httpUpdate.update(otaClient, OTA_FIRMWARE_URL);
+
+  switch (ret) {
+    case HTTP_UPDATE_FAILED:
+      Serial.printf("[OTA] Update failed: %s (%d)\n",
+                    httpUpdate.getLastErrorString().c_str(),
+                    httpUpdate.getLastError());
+      break;
+    case HTTP_UPDATE_NO_UPDATES:
+      Serial.println("[OTA] No update available");
+      break;
+    case HTTP_UPDATE_OK:
+      Serial.println("[OTA] Update successful! Rebooting...");
+      // ESP32 will reboot automatically after successful update
+      break;
+  }
+}
+
+// ======================== AUTO-RESTART WATCHDOG ========================
+
+/**
+ * Restart ESP32 with a reason logged to Serial
+ */
+void restartESP(const char* reason) {
+  Serial.println("\n========================================");
+  Serial.printf("[!!!] AUTO-RESTART: %s\n", reason);
+  Serial.println("========================================\n");
+  Serial.flush();
+  delay(1000);
+  ESP.restart();
+}
+
+/**
+ * Check all restart conditions and reboot if any are met:
+ * 1. Uptime exceeds RESTART_AFTER_UPTIME (4 hours)
+ * 2. WiFi has been disconnected for RESTART_WIFI_FAIL_MS (20 min)
+ * 3. Hikvision device unreachable for RESTART_HIK_FAIL_MS (20 min)
+ */
+void checkAutoRestart() {
+  unsigned long now = millis();
+
+  // 1. Scheduled restart after max uptime
+  if (now >= RESTART_AFTER_UPTIME) {
+    restartESP("Max uptime reached (4 hours), performing scheduled restart");
+  }
+
+  // 2. WiFi failure watchdog
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiFailSince == 0) {
+      wifiFailSince = now;
+      Serial.printf("[!] WiFi failure detected, watchdog started (%lu min timeout)\n",
+                    RESTART_WIFI_FAIL_MS / 60000);
+    } else if (now - wifiFailSince >= RESTART_WIFI_FAIL_MS) {
+      restartESP("WiFi disconnected for 20+ minutes");
+    }
+  } else {
+    // WiFi is connected, reset the failure tracker
+    if (wifiFailSince != 0) {
+      Serial.println("[*] WiFi recovered, watchdog reset");
+    }
+    wifiFailSince = 0;
+  }
+
+  // 3. Hikvision connection failure watchdog
+  if (!isLoggedIn) {
+    if (hikFailSince == 0) {
+      hikFailSince = now;
+      Serial.printf("[!] Hik connection failure detected, watchdog started (%lu min timeout)\n",
+                    RESTART_HIK_FAIL_MS / 60000);
+    } else if (now - hikFailSince >= RESTART_HIK_FAIL_MS) {
+      restartESP("Hikvision device unreachable for 20+ minutes");
+    }
+  } else {
+    // Hik is connected, reset the failure tracker
+    if (hikFailSince != 0) {
+      Serial.println("[*] Hik connection recovered, watchdog reset");
+    }
+    hikFailSince = 0;
+  }
+}
+
 // ======================== ARDUINO FUNCTIONS ========================
+
+// Forward declaration
+void initiateValues(bool isReconnect = false);
 
 void setup() {
   Serial.begin(115200);
   delay(2000);
+  deviceId = getDeviceId();
+   Serial.println("device Id is = ");
+    Serial.print(deviceId);
 
   Serial.println("\n[*] Hikvision ESP32 Client V2");
+  Serial.printf("[*] Firmware version: %s\n", FIRMWARE_VERSION);
 
   // Connect to WiFi
-  Serial.printf("[*] Connecting to WiFi: %s", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("\n[!] WiFi connection failed!");
+  if (!connectWiFi(false)) {
     return;
   }
 
-  Serial.println(" OK");
-  Serial.printf("[*] IP: %s | RSSI: %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  // Check for OTA update before proceeding
+  checkForOTAUpdate();
+  lastOTACheck = millis();
 
   // Get device ID
-  deviceId = getDeviceId();
-  Serial.printf("[*] Device ID: %s\n", deviceId.c_str());
+  initiateValues();
+}
+
+void initiateValues(bool isReconnect){
+  // Only get device ID on first run (it never changes)
+  if (!isReconnect) {
+    deviceId = getDeviceId();
+    Serial.printf("[*] Device ID: %s\n", deviceId.c_str());
+  }
 
   // Sync time via NTP - REQUIRED for proper operation
   // Timezone +08:00 (8 hours * 3600 seconds) to match Hikvision device
   Serial.print("[*] NTP sync...");
-  configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+  configTime(3 * 3600, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
 
   int ntpRetries = 0;
   while (time(nullptr) < 1000000000 && ntpRetries < 60) {  // Wait up to 30 seconds
@@ -1185,28 +1387,38 @@ void setup() {
     time_t now = time(nullptr);
     Serial.printf(" OK (%s", ctime(&now));
 
-    // Try to get last event time from server API
-    lastEventTime = getLastTimeFromServer();
+    // Only fetch lastEventTime from server on initial setup
+    // On reconnect, keep the existing lastEventTime to avoid re-processing events
+    if (!isReconnect) {
+      lastEventTime = getLastTimeFromServer();
 
-    // If server didn't return a valid time, fall back to start of today
-    if (lastEventTime.length() == 0 || lastEventTime.startsWith("1970")) {
-      struct tm timeinfo;
-      localtime_r(&now, &timeinfo);
-      char buffer[30];
-      sprintf(buffer, "%04d-%02d-%02dT00:00:00+08:00",
-              timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
-      lastEventTime = String(buffer);
-      Serial.printf("[*] Using default start time: %s\n", lastEventTime.c_str());
-    } else {
-      Serial.printf("[*] Resuming from server time: %s\n", lastEventTime.c_str());
+      // If server didn't return a valid time, fall back to start of today
+      if (lastEventTime.length() == 0 || lastEventTime.startsWith("1970")) {
+        struct tm timeinfo;
+        localtime_r(&now, &timeinfo);
+        char buffer[30];
+        sprintf(buffer, "%04d-%02d-%02dT00:00:00+08:00",
+                timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
+        lastEventTime = String(buffer);
+        Serial.printf("[*] Using default start time: %s\n", lastEventTime.c_str());
+      } else {
+        Serial.printf("[*] Resuming from server time: %s\n", lastEventTime.c_str());
+      }
+
+      randomSeed(analogRead(0));
     }
   } else {
-    Serial.println(" FAILED - Cannot proceed without time sync!");
-    Serial.println("[!] Please check internet connection and restart");
-    while(1) { delay(1000); }  // Halt - time sync is required
+    Serial.println(" FAILED");
+    if (isReconnect) {
+      // On reconnect, don't halt - just warn and continue (time might still be valid)
+      Serial.println("[!] NTP sync failed, continuing with cached time...");
+    } else {
+      // On initial setup, halt - we can't proceed without time
+      Serial.println("[!] Cannot proceed without time sync!");
+      Serial.println("[!] Please check internet connection and restart");
+      while(1) { delay(1000); }
+    }
   }
-
-  randomSeed(analogRead(0));
 
   // Login to Hikvision device
   Serial.print("[*] Logging into Hikvision...");
@@ -1216,26 +1428,50 @@ void setup() {
   }
   Serial.println(" OK");
 
-  // Test server connectivity using parsed URL
-  UrlParts server = parseUrl(String(TRACKER_SERVER));
-  Serial.printf("[*] Testing connection to %s:%d...\n", server.host.c_str(), server.port);
-  WiFiClient testClient;
-  if (testClient.connect(server.host.c_str(), server.port)) {
-    Serial.println("[+] Server reachable!");
-    testClient.stop();
-  } else {
-    Serial.println("[!] Cannot reach server - check firewall/network");
+  // Only test server connectivity on initial setup
+  if (!isReconnect) {
+    UrlParts server = parseUrl(String(TRACKER_SERVER));
+    Serial.printf("[*] Testing connection to %s:%d...\n", server.host.c_str(), server.port);
+    WiFiClient testClient;
+    if (testClient.connect(server.host.c_str(), server.port)) {
+      Serial.println("[+] Server reachable!");
+      testClient.stop();
+    } else {
+      Serial.println("[!] Cannot reach server - check firewall/network");
+    }
   }
 
-  // Initial fetch of events
+  // Fetch events
   fetchAttendanceEvents(5);
 }
 
 void loop() {
   unsigned long currentMillis = millis();
 
-  // Check every 60 seconds
+  // Check auto-restart conditions every loop iteration
+  checkAutoRestart();
+
+  // Periodic OTA update check
+  if (currentMillis - lastOTACheck >= OTA_CHECK_INTERVAL) {
+    checkForOTAUpdate();
+    lastOTACheck = currentMillis;
+  }
+
+  // Check every 5 seconds
   if (currentMillis - lastHeartbeat >= 5000) {
+
+    // First check WiFi connectivity
+    if (WiFi.status() != WL_CONNECTED) {
+      if (!connectWiFi(true)) {
+        lastHeartbeat = currentMillis;
+        delay(1000);
+        return;
+      } else {
+        initiateValues(true);  // true = reconnect mode
+      }
+    }
+
+    // WiFi is connected, proceed with heartbeat
     if (sendHeartbeat()) {
       // Fetch attendance events on successful heartbeat
       fetchAttendanceEvents(5);
@@ -1249,6 +1485,12 @@ void loop() {
 
       // Keep trying to login until successful
       while (!isLoggedIn) {
+        // Check WiFi before attempting login
+        if (WiFi.status() != WL_CONNECTED) {
+          Serial.println("[!] WiFi lost during login, breaking...");
+          break;
+        }
+
         if (hikvisionLogin()) {
           Serial.println("[+] Re-login OK");
           fetchAttendanceEvents(5);
