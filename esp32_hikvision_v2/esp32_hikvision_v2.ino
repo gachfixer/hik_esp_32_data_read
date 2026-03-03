@@ -36,7 +36,8 @@ const char* OTA_FIRMWARE_URL = "http://102.217.125.188:8084/kivaywa.bin";
 const unsigned long OTA_CHECK_INTERVAL = 30UL * 60 * 1000;  // Check every 30 minutes
 static unsigned long lastOTACheck = 0;
 
-// WiFi credentials
+// WiFi credentials kivaywa code
+
 const char* WIFI_SSID = "TP-Link_DD78";
 const char* WIFI_PASSWORD = "Kivaywa.2026@Tifter";
 
