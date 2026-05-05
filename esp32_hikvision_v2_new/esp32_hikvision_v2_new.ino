@@ -28,19 +28,20 @@
 // ======================== CONFIGURATION ========================
 
 // Firmware version
-#define FIRMWARE_VERSION "1.0.1"
+#define FIRMWARE_VERSION "1.0.0"
 
 // OTA update configuration
-const char* OTA_VERSION_URL = "http://102.217.125.188:8084/api/version/kivaywa";
-const char* OTA_FIRMWARE_URL = "http://102.217.125.188:8084/kivaywa.bin";
+const char* OTA_VERSION_URL = "http://102.217.125.188:8084/api/version/spa";
+const char* OTA_FIRMWARE_URL = "http://102.217.125.188:8084/spa.bin";
 const unsigned long OTA_CHECK_INTERVAL = 30UL * 60 * 1000;  // Check every 30 minutes
 static unsigned long lastOTACheck = 0;
 
-const char* WIFI_SSID = "TP-Link_DD78";
-const char* WIFI_PASSWORD = "Kivaywa.2026@Tifter";
+// WiFi credentials
+const char* WIFI_SSID = "Billionaires_IOT";
+const char* WIFI_PASSWORD = "billionaires.2026!!";
 
 // Hikvision device credentials
-const char* HIK_IP = "192.168.1.103";
+const char* HIK_IP = "10.10.1.211";
 const char* HIK_IPP = "192.168.0.176";
 const char* HIK_USERNAME = "admin";
 const char* HIK_PASSWORD = "dev@spa!";
@@ -603,7 +604,6 @@ bool hikvisionLogin() {
     if (sessionTagResponse.length() > 0) {
       sessionTag = sessionTagResponse;
     }
-
     isLoggedIn = true;
     return true;
   }
@@ -1599,4 +1599,3 @@ void loop() {
 
   delay(1000);
 }
-

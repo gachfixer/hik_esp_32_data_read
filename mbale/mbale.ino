@@ -28,20 +28,20 @@
 // ======================== CONFIGURATION ========================
 
 // Firmware version
-#define FIRMWARE_VERSION "1.0.1"
+#define FIRMWARE_VERSION "1.0.0"
 
-// OTA update configuration
-const char* OTA_VERSION_URL = "http://102.217.125.188:8084/api/version/kivaywa";
-const char* OTA_FIRMWARE_URL = "http://102.217.125.188:8084/kivaywa.bin";
+// OTA update configuration  https://api.scantrack.ndovupay.org
+const char* OTA_VERSION_URL = "https://api.scantrack.ndovupay.org/api/version/spa";
+const char* OTA_FIRMWARE_URL = "https://api.scantrack.ndovupay.org/mbale.bin";
 const unsigned long OTA_CHECK_INTERVAL = 30UL * 60 * 1000;  // Check every 30 minutes
 static unsigned long lastOTACheck = 0;
 
-const char* WIFI_SSID = "TP-Link_DD78";
-const char* WIFI_PASSWORD = "Kivaywa.2026@Tifter";
+// WiFi credentials
+const char* WIFI_SSID = "scantracker";
+const char* WIFI_PASSWORD = "dev@spA!!dev1";
 
 // Hikvision device credentials
-const char* HIK_IP = "192.168.1.103";
-const char* HIK_IPP = "192.168.0.176";
+const char* HIK_IP = "192.168.0.201";
 const char* HIK_USERNAME = "admin";
 const char* HIK_PASSWORD = "dev@spa!";
 const bool USE_HTTPS = false;
@@ -60,7 +60,7 @@ static unsigned long wifiFailSince = 0;
 static unsigned long hikFailSince  = 0;
 
 // Server to send attendance data
-const char* TRACKER_SERVER = "http://102.217.125.188:8084";
+const char* TRACKER_SERVER = "https://api.scantrack.ndovupay.org";
 
 // ======================== GLOBAL VARIABLES ========================
 
@@ -603,7 +603,6 @@ bool hikvisionLogin() {
     if (sessionTagResponse.length() > 0) {
       sessionTag = sessionTagResponse;
     }
-
     isLoggedIn = true;
     return true;
   }
@@ -1599,4 +1598,3 @@ void loop() {
 
   delay(1000);
 }
-
